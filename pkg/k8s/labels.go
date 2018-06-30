@@ -67,21 +67,31 @@ const (
 	 * Component Names
 	 */
 
-	// CertificateBundleName is the name of the ConfigMap that holds the root
-	// certificate
-	CertificateBundleName = "conduit-ca-bundle"
+	// TLSTrustAnchorConfigMapName is the name of the ConfigMap that holds the
+	// trust anchors (trusted root certificates).
+	TLSTrustAnchorConfigMapName = "conduit-ca-bundle"
+
+	// TLSTrustAnchorFileName is the name (key) within the trust anchor ConfigMap
+	// that contains the actual trust anchor bundle.
+	TLSTrustAnchorFileName = "trust-anchors.pem"
+
+	TLSCertFileName       = "certificate.crt"
+	TLSPrivateKeyFileName = "private-key.p8"
 )
 
-var proxyLabels = []string{
-	ControllerNSLabel,
+var podOwnerLabels = []string{
 	ProxyDeploymentLabel,
 	ProxyReplicationControllerLabel,
 	ProxyReplicaSetLabel,
 	ProxyJobLabel,
 	ProxyDaemonSetLabel,
 	ProxyStatefulSetLabel,
-	k8sV1.DefaultDeploymentUniqueLabelKey,
 }
+
+var proxyLabels = append(podOwnerLabels, []string{
+	ControllerNSLabel,
+	k8sV1.DefaultDeploymentUniqueLabelKey,
+}...)
 
 // CreatedByAnnotationValue returns the value associated with
 // CreatedByAnnotation.
@@ -106,6 +116,15 @@ func GetControllerNs(objectMeta meta.ObjectMeta) string {
 	return objectMeta.Labels[ControllerNSLabel]
 }
 
+func GetOwnerKindAndName(labels map[string]string) (string, string) {
+	for _, label := range podOwnerLabels {
+		if v, ok := labels[label]; ok {
+			return toOwnerLabel(label), v
+		}
+	}
+	return "", ""
+}
+
 // toOwnerLabel converts a proxy label to a prometheus label, following the
 // relabel conventions from the prometheus scrape config file
 func toOwnerLabel(proxyLabel string) string {
@@ -117,4 +136,38 @@ func toOwnerLabel(proxyLabel string) string {
 		return "k8s_job"
 	}
 	return strings.Replace(stripped, "-", "_", -1)
+}
+
+// TLSIdentity is the identity of a pod template (Deployment, Pod,
+// ReplicationController, etc.).
+type TLSIdentity struct {
+	// The name of the pod template.
+	Name string
+
+	// Kind is the result of GetOwnerType(pod.ObjectMeta) for a pod template.
+	Kind string
+
+	// Namespace is the pod template's namespace.
+	Namespace string
+
+	// ControllerNamespace is the namespace of the controller for the pod.
+	ControllerNamespace string
+}
+
+func (i TLSIdentity) ToDNSName() string {
+	return fmt.Sprintf("%s.%s.%s.conduit-managed.%s.svc.cluster.local", i.Name,
+		i.Kind, i.Namespace, i.ControllerNamespace)
+}
+
+func (i TLSIdentity) ToSecretName() string {
+	return fmt.Sprintf("%s-%s-tls-conduit-io", i.Name, i.Kind)
+}
+
+func (i TLSIdentity) ToControllerIdentity() TLSIdentity {
+	return TLSIdentity{
+		Name:                "controller",
+		Kind:                "deployment",
+		Namespace:           i.ControllerNamespace,
+		ControllerNamespace: i.ControllerNamespace,
+	}
 }

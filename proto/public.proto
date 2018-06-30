@@ -17,6 +17,9 @@ message VersionInfo {
   string releaseVersion = 3;
 }
 
+message ListPodsRequest {
+  string namespace = 1;
+}
 message ListPodsResponse {
   repeated Pod pods = 1;
 }
@@ -30,6 +33,7 @@ message Pod {
   google.protobuf.Duration sinceLastReport = 6;
   string controllerNamespace = 7; // namespace of controller this pod reports to
   bool controlPlane = 8; // true if this pod is part of the control plane
+  google.protobuf.Duration uptime = 9; // uptime of this pod
 }
 
 message TapRequest {
@@ -122,14 +126,15 @@ message Resource {
   // If empty, indicates all namespaces should be considered.
   string namespace = 1;
 
-  // The type of Kubernetes resource.
+  // The type of resource.
   //
-  // E.g. pod, deployment, service, ...
-  //
-  // If `all` refers, to all resource types.
+  // This can be:
+  // - "all" -- includes all Kubernetes resource types only
+  // - "authority" -- a special resource type derived from request `:authority` values
+  // - Otherwise, the resource type may be any Kubernetes resource (e.g. "namespace", "deployment").
   string type = 2;
 
-  // An optional Kubernetes resource name.
+  // An optional resource name.
   string name = 3;
 }
 
@@ -211,7 +216,7 @@ message StatTable {
 service Api {
   rpc StatSummary(StatSummaryRequest) returns (StatSummaryResponse) {}
 
-  rpc ListPods(Empty) returns (ListPodsResponse) {}
+  rpc ListPods(ListPodsRequest) returns (ListPodsResponse) {}
 
   // Superceded by `TapByResource`.
   rpc Tap(TapRequest) returns (stream common.TapEvent) { option deprecated = true; }

@@ -564,9 +564,12 @@ impl fmt::Display for ctx::transport::TlsStatus {
         match *self {
             Conditional::Some(()) => f.pad(",tls=\"true\""),
             Conditional::None(tls::ReasonForNoTls::NoConfig) => f.pad(",tls=\"no_config\""),
+            Conditional::None(tls::ReasonForNoTls::HandshakeFailed) =>
+                f.pad("tls=\"handshake_failed\""),
             Conditional::None(tls::ReasonForNoTls::Disabled) |
             Conditional::None(tls::ReasonForNoTls::InternalTraffic) |
-            Conditional::None(tls::ReasonForNoTls::NoIdentity(_)) => Ok(()),
+            Conditional::None(tls::ReasonForNoTls::NoIdentity(_)) |
+            Conditional::None(tls::ReasonForNoTls::NotProxyTls) => Ok(()),
         }
     }
 }

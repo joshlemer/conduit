@@ -22,10 +22,13 @@ import (
 )
 
 const (
-	// LocalhostDNSNameOverride allows override of the controlPlaneDNS
-	LocalhostDNSNameOverride = "localhost"
+	// LocalhostDNSNameOverride allows override of the controlPlaneDNS. This
+	// must be in absolute form for the proxy to special-case it.
+	LocalhostDNSNameOverride = "localhost."
 	// ControlPlanePodName default control plane pod name.
 	ControlPlanePodName = "controller"
+	// The name of the variable used to pass the pod's namespace.
+	PodNamespaceEnvVarName = "CONDUIT_PROXY_POD_NAMESPACE"
 )
 
 type injectOptions struct {
@@ -108,15 +111,34 @@ func runInjectCmd(input io.Reader, errWriter, outWriter io.Writer, options *inje
 	return 0
 }
 
-/* Given a PodTemplateSpec, return a new PodTemplateSpec with the sidecar
- * and init-container injected. If the pod is unsuitable for having them
- * injected, return null.
+/* Given a ObjectMeta, update ObjectMeta in place with the new labels and
+ * annotations.
  */
-func injectPodTemplateSpec(t *v1.PodTemplateSpec, controlPlaneDNSNameOverride string, k8sLabels map[string]string, options *injectOptions) bool {
+func injectObjectMeta(t *metaV1.ObjectMeta, k8sLabels map[string]string, options *injectOptions) {
+	if t.Annotations == nil {
+		t.Annotations = make(map[string]string)
+	}
+	t.Annotations[k8s.CreatedByAnnotation] = k8s.CreatedByAnnotationValue()
+	t.Annotations[k8s.ProxyVersionAnnotation] = options.conduitVersion
+
+	if t.Labels == nil {
+		t.Labels = make(map[string]string)
+	}
+	t.Labels[k8s.ControllerNSLabel] = controlPlaneNamespace
+	for k, v := range k8sLabels {
+		t.Labels[k] = v
+	}
+}
+
+/* Given a PodSpec, update the PodSpec in place with the sidecar
+ * and init-container injected. If the pod is unsuitable for having them
+ * injected, return false.
+ */
+func injectPodSpec(t *v1.PodSpec, identity k8s.TLSIdentity, controlPlaneDNSNameOverride string, options *injectOptions) bool {
 	// Pods with `hostNetwork=true` share a network namespace with the host. The
 	// init-container would destroy the iptables configuration on the host, so
 	// skip the injection in this case.
-	if t.Spec.HostNetwork {
+	if t.HostNetwork {
 		return false
 	}
 
@@ -196,28 +218,60 @@ func injectPodTemplateSpec(t *v1.PodTemplateSpec, controlPlaneDNSNameOverride st
 			{Name: "CONDUIT_PROXY_PRIVATE_LISTENER", Value: fmt.Sprintf("tcp://127.0.0.1:%d", options.outboundPort)},
 			{Name: "CONDUIT_PROXY_PUBLIC_LISTENER", Value: fmt.Sprintf("tcp://0.0.0.0:%d", options.inboundPort)},
 			{
-				Name:      "CONDUIT_PROXY_POD_NAMESPACE",
+				Name:      PodNamespaceEnvVarName,
 				ValueFrom: &v1.EnvVarSource{FieldRef: &v1.ObjectFieldSelector{FieldPath: "metadata.namespace"}},
 			},
 		},
 	}
 
-	if t.Annotations == nil {
-		t.Annotations = make(map[string]string)
-	}
-	t.Annotations[k8s.CreatedByAnnotation] = k8s.CreatedByAnnotationValue()
-	t.Annotations[k8s.ProxyVersionAnnotation] = options.conduitVersion
+	if options.enableTLS() {
+		yes := true
 
-	if t.Labels == nil {
-		t.Labels = make(map[string]string)
-	}
-	t.Labels[k8s.ControllerNSLabel] = controlPlaneNamespace
-	for k, v := range k8sLabels {
-		t.Labels[k] = v
+		configMapVolume := v1.Volume{
+			Name: "conduit-trust-anchors",
+			VolumeSource: v1.VolumeSource{
+				ConfigMap: &v1.ConfigMapVolumeSource{
+					LocalObjectReference: v1.LocalObjectReference{Name: k8s.TLSTrustAnchorConfigMapName},
+					Optional:             &yes,
+				},
+			},
+		}
+		secretVolume := v1.Volume{
+			Name: "conduit-secrets",
+			VolumeSource: v1.VolumeSource{
+				Secret: &v1.SecretVolumeSource{
+					SecretName: identity.ToSecretName(),
+					Optional:   &yes,
+				},
+			},
+		}
+
+		base := "/var/conduit-io"
+		configMapBase := base + "/trust-anchors"
+		secretBase := base + "/identity"
+		tlsEnvVars := []v1.EnvVar{
+			{Name: "CONDUIT_PROXY_TLS_TRUST_ANCHORS", Value: configMapBase + "/" + k8s.TLSTrustAnchorFileName},
+			{Name: "CONDUIT_PROXY_TLS_CERT", Value: secretBase + "/" + k8s.TLSCertFileName},
+			{Name: "CONDUIT_PROXY_TLS_PRIVATE_KEY", Value: secretBase + "/" + k8s.TLSPrivateKeyFileName},
+			{
+				Name:  "CONDUIT_PROXY_TLS_POD_IDENTITY",
+				Value: identity.ToDNSName(),
+			},
+			{Name: "CONDUIT_PROXY_CONTROLLER_NAMESPACE", Value: controlPlaneNamespace},
+			{Name: "CONDUIT_PROXY_TLS_CONTROLLER_IDENTITY", Value: identity.ToControllerIdentity().ToDNSName()},
+		}
+
+		sidecar.Env = append(sidecar.Env, tlsEnvVars...)
+		sidecar.VolumeMounts = []v1.VolumeMount{
+			{Name: configMapVolume.Name, MountPath: configMapBase, ReadOnly: true},
+			{Name: secretVolume.Name, MountPath: secretBase, ReadOnly: true},
+		}
+
+		t.Volumes = append(t.Volumes, configMapVolume, secretVolume)
 	}
 
-	t.Spec.Containers = append(t.Spec.Containers, sidecar)
-	t.Spec.InitContainers = append(t.Spec.InitContainers, initContainer)
+	t.Containers = append(t.Containers, sidecar)
+	t.InitContainers = append(t.InitContainers, initContainer)
 
 	return true
 }
@@ -299,7 +353,8 @@ func injectResource(bytes []byte, options *injectOptions) ([]byte, error) {
 	// obj and podTemplateSpec will reference zero or one the following
 	// objects, depending on the type.
 	var obj interface{}
-	var podTemplateSpec *v1.PodTemplateSpec
+	var podSpec *v1.PodSpec
+	var objectMeta *metaV1.ObjectMeta
 	var DNSNameOverride string
 	k8sLabels := map[string]string{}
 
@@ -328,7 +383,9 @@ func injectResource(bytes []byte, options *injectOptions) ([]byte, error) {
 
 		obj = &deployment
 		k8sLabels[k8s.ProxyDeploymentLabel] = deployment.Name
-		podTemplateSpec = &deployment.Spec.Template
+		podSpec = &deployment.Spec.Template.Spec
+		objectMeta = &deployment.Spec.Template.ObjectMeta
+
 	case "ReplicationController":
 		var rc v1.ReplicationController
 		if err := yaml.Unmarshal(bytes, &rc); err != nil {
@@ -337,7 +394,9 @@ func injectResource(bytes []byte, options *injectOptions) ([]byte, error) {
 
 		obj = &rc
 		k8sLabels[k8s.ProxyReplicationControllerLabel] = rc.Name
-		podTemplateSpec = rc.Spec.Template
+		podSpec = &rc.Spec.Template.Spec
+		objectMeta = &rc.Spec.Template.ObjectMeta
+
 	case "ReplicaSet":
 		var rs v1beta1.ReplicaSet
 		if err := yaml.Unmarshal(bytes, &rs); err != nil {
@@ -346,7 +405,9 @@ func injectResource(bytes []byte, options *injectOptions) ([]byte, error) {
 
 		obj = &rs
 		k8sLabels[k8s.ProxyReplicaSetLabel] = rs.Name
-		podTemplateSpec = &rs.Spec.Template
+		podSpec = &rs.Spec.Template.Spec
+		objectMeta = &rs.Spec.Template.ObjectMeta
+
 	case "Job":
 		var job batchV1.Job
 		if err := yaml.Unmarshal(bytes, &job); err != nil {
@@ -355,7 +416,9 @@ func injectResource(bytes []byte, options *injectOptions) ([]byte, error) {
 
 		obj = &job
 		k8sLabels[k8s.ProxyJobLabel] = job.Name
-		podTemplateSpec = &job.Spec.Template
+		podSpec = &job.Spec.Template.Spec
+		objectMeta = &job.Spec.Template.ObjectMeta
+
 	case "DaemonSet":
 		var ds v1beta1.DaemonSet
 		if err := yaml.Unmarshal(bytes, &ds); err != nil {
@@ -364,7 +427,9 @@ func injectResource(bytes []byte, options *injectOptions) ([]byte, error) {
 
 		obj = &ds
 		k8sLabels[k8s.ProxyDaemonSetLabel] = ds.Name
-		podTemplateSpec = &ds.Spec.Template
+		podSpec = &ds.Spec.Template.Spec
+		objectMeta = &ds.Spec.Template.ObjectMeta
+
 	case "StatefulSet":
 		var statefulset appsV1.StatefulSet
 		if err := yaml.Unmarshal(bytes, &statefulset); err != nil {
@@ -373,23 +438,51 @@ func injectResource(bytes []byte, options *injectOptions) ([]byte, error) {
 
 		obj = &statefulset
 		k8sLabels[k8s.ProxyStatefulSetLabel] = statefulset.Name
-		podTemplateSpec = &statefulset.Spec.Template
+		podSpec = &statefulset.Spec.Template.Spec
+		objectMeta = &statefulset.Spec.Template.ObjectMeta
+
+	case "Pod":
+		var pod v1.Pod
+		if err := yaml.Unmarshal(bytes, &pod); err != nil {
+			return nil, err
+		}
+
+		obj = &pod
+		podSpec = &pod.Spec
+		objectMeta = &pod.ObjectMeta
+
 	case "List":
 		// Lists are a little different than the other types. There's no immediate
 		// pod template. Because of this, we do a recursive call for each element
 		// in the list (instead of just marshaling the injected pod template).
 		return injectList(bytes, options)
+
 	}
 
 	// If we don't inject anything into the pod template then output the
 	// original serialization of the original object. Otherwise, output the
 	// serialization of the modified object.
 	output := bytes
-	if podTemplateSpec != nil && injectPodTemplateSpec(podTemplateSpec, DNSNameOverride, k8sLabels, options) {
-		var err error
-		output, err = yaml.Marshal(obj)
-		if err != nil {
-			return nil, err
+	if podSpec != nil {
+		ownerKind, ownerName := k8s.GetOwnerKindAndName(k8sLabels)
+
+		// The namespace isn't necessarily in the input so it has to be substituted
+		// at runtime. The proxy recognizes the "$NAME" syntax for this variable
+		// but not necessarily other variables.
+		identity := k8s.TLSIdentity{
+			Name:                ownerName,
+			Kind:                ownerKind,
+			Namespace:           "$" + PodNamespaceEnvVarName,
+			ControllerNamespace: controlPlaneNamespace,
+		}
+
+		if injectPodSpec(podSpec, identity, DNSNameOverride, options) {
+			injectObjectMeta(objectMeta, k8sLabels, options)
+			var err error
+			output, err = yaml.Marshal(obj)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 

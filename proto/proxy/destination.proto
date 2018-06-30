@@ -86,19 +86,16 @@ message WeightedAddr {
 // Which strategy should be used for verifying TLS.
 message TlsIdentity {
   oneof strategy {
-    K8sPodNamespace k8s_pod_namespace = 1;
+    K8sPodIdentity k8s_pod_identity = 2;
   }
 
-  // Verify the certificate based on the Kubernetes pod name, and ensure
-  // that the pod is configured with the same Conduit control plane
-  // namespace as this proxy.
-  message K8sPodNamespace {
+  // Verify the certificate based on the Kubernetes pod identity.
+  message K8sPodIdentity {
+    // The pod_identity string is of the format:
+    // {owner_name}.{owner_type}.{pod_ns}.conduit-managed.{controller_ns}.svc.cluster.local
+    string pod_identity = 1;
     // The Kubernetes namespace of the pod's Conduit control plane.
-    string controller_ns = 1;
-    // The Kubernetes namespace that the pod is in.
-    string pod_ns = 2;
-    // The name of the pod.
-    string pod_name = 3;
+    string controller_ns = 2;
   }
 }
 

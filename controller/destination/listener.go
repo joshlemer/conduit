@@ -157,12 +157,21 @@ func (l *endpointListener) toTlsIdentity(pod *coreV1.Pod) *pb.TlsIdentity {
 		return nil
 	}
 
+	controllerNs := pkgK8s.GetControllerNs(pod.ObjectMeta)
+	ownerKind, ownerName := pkgK8s.GetOwnerKindAndName(pod.Labels)
+
+	identity := pkgK8s.TLSIdentity{
+		Name:                ownerName,
+		Kind:                ownerKind,
+		Namespace:           pod.Namespace,
+		ControllerNamespace: controllerNs,
+	}
+
 	return &pb.TlsIdentity{
-		Strategy: &pb.TlsIdentity_K8SPodNamespace_{
-			K8SPodNamespace: &pb.TlsIdentity_K8SPodNamespace{
-				ControllerNs: pkgK8s.GetControllerNs(pod.ObjectMeta),
-				PodNs:        pod.Namespace,
-				PodName:      pod.Name,
+		Strategy: &pb.TlsIdentity_K8SPodIdentity_{
+			K8SPodIdentity: &pb.TlsIdentity_K8SPodIdentity{
+				PodIdentity:  identity.ToDNSName(),
+				ControllerNs: controllerNs,
 			},
 		},
 	}
